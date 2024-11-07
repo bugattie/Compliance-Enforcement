@@ -1,0 +1,328 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "CloudFormation template for compliance enforcement using AWS Config, Systems Manager, and Lambda"
+
+Resources:
+  # AWS Config Role
+  AWSConfigRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action: "sts:AssumeRole"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWS_ConfigRole"
+      Policies:
+        - PolicyName: ConfigS3BucketPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "s3:PutObject"
+                Resource: !Sub "arn:aws:s3:::${ConfigBucket}/*"
+                Condition:
+                  StringLike:
+                    "s3:x-amz-acl": "bucket-owner-full-control"
+
+  ConfigRemediationRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: ConfigRemediationPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "ssm:StartAutomationExecution"
+                  - "ssm:DescribeAutomationExecution"
+                Resource: "*"
+
+  # Lambda Execution Role
+  LambdaExecutionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: "sts:AssumeRole"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Policies:
+        - PolicyName: LambdaConfigRemediationPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "ec2:DescribeInstances"
+                  - "ec2:CreateTags"
+                  - "ssm:SendCommand"
+                  - "config:GetResourceConfigHistory"
+                  - "ec2:DeleteTags"
+                  - "ec2:MonitorInstances"
+                  - "tag:*"
+                Resource: "*"
+
+  # AWS Config Recorder
+  ConfigRecorder:
+    Type: "AWS::Config::ConfigurationRecorder"
+    Properties:
+      RoleARN: !GetAtt AWSConfigRole.Arn
+      RecordingGroup:
+        AllSupported: true
+        IncludeGlobalResourceTypes: false
+
+  # AWS Config Delivery Channel
+  ConfigDeliveryChannel:
+    Type: AWS::Config::DeliveryChannel
+    Properties:
+      ConfigSnapshotDeliveryProperties:
+        DeliveryFrequency: Six_Hours
+      S3BucketName: !Ref ConfigBucket
+      S3KeyPrefix: Config
+
+  # S3 Bucket for AWS Config
+  ConfigBucket:
+    Type: "AWS::S3::Bucket"
+    DeletionPolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  # AWS Config Rules
+  RequiredTagsRule:
+    Type: "AWS::Config::ConfigRule"
+    DependsOn: ConfigRecorder
+    Properties:
+      ConfigRuleName: required-tags
+      Source:
+        Owner: AWS
+        SourceIdentifier: REQUIRED_TAGS
+      InputParameters:
+        tag1Key: Environment
+        tag1Value: Prod
+
+  EC2DetailedMonitoringRule:
+    Type: "AWS::Config::ConfigRule"
+    DependsOn: ConfigRecorder
+    Properties:
+      ConfigRuleName: ec2-detailed-monitoring
+      Source:
+        Owner: AWS
+        SourceIdentifier: EC2_INSTANCE_DETAILED_MONITORING_ENABLED
+
+  # Remediation Configuration for Required Tags Rule
+  RequiredTagsRemediationConfiguration:
+    Type: "AWS::Config::RemediationConfiguration"
+    Properties:
+      ConfigRuleName: !Ref RequiredTagsRule
+      TargetType: SSM_DOCUMENT
+      TargetId: !Ref RequiredTagsRemediationDocument
+      Parameters:
+        instanceId:
+          ResourceValue:
+            Value: RESOURCE_ID
+      MaximumAutomaticAttempts: 5
+      RetryAttemptSeconds: 60
+
+  # Remediation Configuration for EC2 Detailed Monitoring Rule
+  EC2DetailedMonitoringRemediationConfiguration:
+    Type: "AWS::Config::RemediationConfiguration"
+    Properties:
+      ConfigRuleName: !Ref EC2DetailedMonitoringRule
+      TargetType: SSM_DOCUMENT
+      TargetId: !Ref EC2DetailedMonitoringRemediationDocument
+      Parameters:
+        instanceId:
+          ResourceValue:
+            Value: RESOURCE_ID
+      MaximumAutomaticAttempts: 5
+      RetryAttemptSeconds: 60
+
+  # Systems Manager Role for EC2
+  SSMInstanceRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: "sts:AssumeRole"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+
+  SSMInstanceProfile:
+    Type: "AWS::IAM::InstanceProfile"
+    Properties:
+      Roles:
+        - !Ref SSMInstanceRole
+
+  # SSM Automation Documents
+  RequiredTagsRemediationDocument:
+    Type: "AWS::SSM::Document"
+    Properties:
+      Content:
+        schemaVersion: "0.3"
+        description: |-
+          *Use this SSM automation document to remediate ec2 instance that have not been properly tagged.*
+        parameters:
+          instanceId:
+            type: "AWS::EC2::Instance::Id"
+        mainSteps:
+          - name: updatetags
+            action: "aws:invokeLambdaFunction"
+            inputs:
+              InvocationType: Event
+              Payload: '"{{instanceId}}"'
+              FunctionName: !GetAtt RequiredTagsRemediationFunction.Arn
+      DocumentType: Automation
+
+  EC2DetailedMonitoringRemediationDocument:
+    Type: "AWS::SSM::Document"
+    Properties:
+      Content:
+        schemaVersion: "0.3"
+        description: |-
+          *Use this SSM automation document to remediate ec2 instance that do not have the standard EC2 instance profile attached.*
+        parameters:
+          instanceId:
+            type: "AWS::EC2::Instance::Id"
+        mainSteps:
+          - name: enableDetailedMonitoring
+            action: "aws:invokeLambdaFunction"
+            inputs:
+              InvocationType: Event
+              Payload: '"{{instanceId}}"'
+              FunctionName: !GetAtt DetailedMonitoringRemediationFunction.Arn
+      DocumentType: Automation
+
+  # Lambda Function for Required Tags Remediation
+  RequiredTagsRemediationFunction:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          """
+          This lambda function reviews tags in all the instance and 
+          Updates the required tags
+          """
+
+          import json
+          import sys
+          import os
+          import os
+          import boto3
+          import base64
+          from botocore.exceptions import ClientError
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              logger.info(event)
+              
+              client = boto3.client('sts')
+              response_account = client.get_caller_identity()['Account']
+              
+              instance = event
+              resourse_ARN = f"arn:aws:ec2:us-east-1:{response_account}:instance/{instance}"
+              logger.info(resourse_ARN)
+              
+              
+              tag_client = boto3.client('resourcegroupstaggingapi')
+              try:
+                  response_tag = tag_client.tag_resources(
+                           ResourceARNList=[
+                               resourse_ARN,
+                           ],
+                           Tags={
+                              'Environment':'Prod'
+                           }
+                               )
+                  print(response_tag)
+              except Exception as exp:
+                  logger.exception(exp)
+                  
+              return {
+                  "compliance_type": "COMPLIANT",
+                  "annotation": "This resource is compliant with the rule."
+              }
+      Runtime: python3.9
+      Timeout: 300
+      MemorySize: 128
+
+  # Lambda Function for Detailed Monitoring Remediation
+  DetailedMonitoringRemediationFunction:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          """
+          This lambda function reviews instance profiles and replaces them with default
+          """
+
+          import json
+          import sys
+          import os
+          import boto3
+          import base64
+          from botocore.exceptions import ClientError
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          ec2 = boto3.resource('ec2')
+          def lambda_handler(event, context):
+              logger.info(event)
+              instance = ec2.Instance(event)
+              try:
+                  response = instance.monitor(
+                      DryRun=False
+                  )
+                  logger.info(response)
+                  return {
+                      "compliance_type": "COMPLIANT",
+                      "annotation": "This resource is compliant with the rule."
+                  }
+              except Exception as exp:
+                  logger.exception(exp)
+      Runtime: python3.9
+      Timeout: 300
+      MemorySize: 128
+
+Outputs:
+  ConfigBucketName:
+    Description: "Name of the S3 bucket used by AWS Config"
+    Value: !Ref ConfigBucket
+
+  LambdaFunctionArn:
+    Description: "ARN of the Lambda remediation function"
+    Value: !GetAtt RequiredTagsRemediationFunction.Arn
+
+  SSMInstanceProfileArn:
+    Description: "ARN of the SSM Instance Profile"
+    Value: !GetAtt SSMInstanceProfile.Arn
